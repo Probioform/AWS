@@ -1,0 +1,64 @@
+const express = require('express');
+const { TextEncoder } = require('util');
+
+const app = express();
+app.use(express.json());
+
+function sha256(message) {
+    const msgBuffer = new TextEncoder().encode(message);
+    const hashBuffer = require('crypto').createHash('sha256').update(msgBuffer).digest();
+    return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+app.post('/sign', (req, res) => {
+    const { awsAccessKeyId, awsSecretAccessKey, region = 'us-east-1', service = 'execute-api', method = 'GET', path = '/' } = req.body;
+
+    const host = `${service}.${region}.amazonaws.com`;
+
+    const now = new Date();
+    const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
+    const dateStamp = amzDate.substr(0, 8);
+
+    const canonicalUri = path;
+    const canonicalQuerystring = '';
+    const canonicalHeaders = `host:${host}\n`;
+    const signedHeaders = 'host';
+    const payloadHash = sha256('');
+
+    const canonicalRequest = [
+        method,
+        canonicalUri,
+        canonicalQuerystring,
+        canonicalHeaders,
+        signedHeaders,
+        payloadHash
+    ].join('\n');
+
+    const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
+
+    const stringToSign = [
+        'AWS4-HMAC-SHA256',
+        amzDate,
+        credentialScope,
+        sha256(canonicalRequest)
+    ].join('\n');
+
+    const signingKey = Buffer.from('AWS4' + awsSecretAccessKey, 'utf8');
+    const signature = require('crypto')
+        .createHmac('sha256', signingKey)
+        .update(stringToSign)
+        .digest('hex');
+
+    const authorizationHeader = `AWS4-HMAC-SHA256 Credential=${awsAccessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+
+    res.json({
+        Authorization: authorizationHeader,
+        'x-amz-date': amzDate,
+        Host: host
+    });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`AWS Signer Service running on port ${PORT}`);
+});
