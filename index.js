@@ -1,97 +1,78 @@
-import express from 'express';
-
+// index.js
+const express = require('express');
+const crypto = require('crypto');
 const app = express();
 app.use(express.json());
 
-app.post('/sign', async (req, res) => {
-  try {
-    const {
-      awsAccessKeyId,
-      awsSecretAccessKey,
-      awsSessionToken = '',
-      region = 'us-east-1',
-      service = 'execute-api',
-      method = 'GET',
-      host,
-      path,
-      queryString = '',
-      payload = '',
-    } = req.body;
+function hash(payload) {
+  return crypto.createHash('sha256').update(payload, 'utf8').digest('hex');
+}
 
-    if (!awsAccessKeyId || !awsSecretAccessKey || !host || !path) {
-      return res.status(400).json({ error: 'Missing required fields' });
-    }
+function hmac(key, data) {
+  return crypto.createHmac('sha256', key).update(data, 'utf8').digest();
+}
 
-    const now = new Date();
-    const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
-    const dateStamp = amzDate.substr(0, 8);
+function getSignatureKey(secret, date, region, service) {
+  const kDate = hmac(`AWS4${secret}`, date);
+  const kRegion = hmac(kDate, region);
+  const kService = hmac(kRegion, service);
+  return hmac(kService, 'aws4_request');
+}
 
-    const enc = new TextEncoder();
+app.post('/sign', (req, res) => {
+  const {
+    awsAccessKeyId,
+    awsSecretAccessKey,
+    awsSessionToken, // optional
+    region,
+    service,
+    method,
+    host,
+    path,
+    payload = ''
+  } = req.body;
 
-    const sha256 = async (str) => {
-      const data = enc.encode(str);
-      const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-      return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
-    };
+  const now = new Date();
+  const amzDate = now.toISOString().replace(/[:-]|\..*/g, '');
+  const dateStamp = amzDate.slice(0, 8);
 
-    const hmac = async (key, data) => {
-      const cryptoKey = await crypto.subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-      return await crypto.subtle.sign('HMAC', cryptoKey, enc.encode(data));
-    };
+  const canonicalHeaders = `host:${host}\n`;
+  const signedHeaders = 'host';
+  const payloadHash = hash(payload);
+  const canonicalRequest = [
+    method,
+    path,
+    '',
+    canonicalHeaders,
+    signedHeaders,
+    payloadHash
+  ].join('\n');
 
-    const getSignatureKey = async (key, date, region, service) => {
-      const kDate = await hmac(enc.encode('AWS4' + key), date);
-      const kRegion = await hmac(kDate, region);
-      const kService = await hmac(kRegion, service);
-      const kSigning = await hmac(kService, 'aws4_request');
-      return kSigning;
-    };
+  const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    credentialScope,
+    hash(canonicalRequest)
+  ].join('\n');
 
-    const payloadHash = await sha256(payload);
-    const canonicalHeaders = `host:${host}\n`;
-    const signedHeaders = 'host';
-    const canonicalRequest = [
-      method.toUpperCase(),
-      path,
-      queryString,
-      canonicalHeaders,
-      signedHeaders,
-      payloadHash
-    ].join('\n');
+  const signingKey = getSignatureKey(awsSecretAccessKey, dateStamp, region, service);
+  const signature = crypto.createHmac('sha256', signingKey).update(stringToSign, 'utf8').digest('hex');
 
-    const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
-    const stringToSign = [
-      'AWS4-HMAC-SHA256',
-      amzDate,
-      credentialScope,
-      await sha256(canonicalRequest)
-    ].join('\n');
+  const authorizationHeader = `AWS4-HMAC-SHA256 Credential=${awsAccessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
 
-    const signingKey = await getSignatureKey(awsSecretAccessKey, dateStamp, region, service);
-    const sigKey = await crypto.subtle.importKey('raw', signingKey, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-    const sig = await crypto.subtle.sign('HMAC', sigKey, enc.encode(stringToSign));
-    const signature = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+  const response = {
+    Authorization: authorizationHeader,
+    'x-amz-date': amzDate,
+    Host: host
+  };
 
-    const authorizationHeader = `AWS4-HMAC-SHA256 Credential=${awsAccessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
-
-    const result = {
-      Authorization: authorizationHeader,
-      'x-amz-date': amzDate,
-      Host: host,
-    };
-
-    if (awsSessionToken) {
-      result['x-amz-security-token'] = awsSessionToken;
-    }
-
-    res.json(result);
-  } catch (err) {
-    console.error('Signing failed:', err);
-    res.status(500).json({ error: err.message });
+  if (awsSessionToken) {
+    response['x-amz-security-token'] = awsSessionToken;
   }
+
+  res.json(response);
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`Signer running on http://localhost:${PORT}`);
-});
+app.listen(PORT, () => console.log(`Signer API running on port ${PORT}`));
